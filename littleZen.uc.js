@@ -21,6 +21,233 @@
   const LITTLE_ZEN_THEME_BRIDGE_TIMEOUT_MS = 250;
   const LITTLE_ZEN_ROUTING_DEBUG_PREF = "extensions.littleZen.debugRouting";
   const LITTLE_ZEN_STALLED_LOAD_TIMEOUT_MS = 25000;
+  const LITTLE_ZEN_RETURN_APP_PREF = "extensions.littleZen.restorePreviousApp";
+  let littleZenMacAppBridge;
+
+  function shouldRestorePreviousApp() {
+    return AppConstants.platform === "macosx" &&
+      Services.prefs.getBoolPref(LITTLE_ZEN_RETURN_APP_PREF, true);
+  }
+
+  function getMacAppBridge() {
+    if (AppConstants.platform !== "macosx") {
+      throw new Error("Previous-app restoration requires macOS");
+    }
+    if (littleZenMacAppBridge) return littleZenMacAppBridge;
+    const { ctypes } = ChromeUtils.importESModule("resource://gre/modules/ctypes.sys.mjs");
+    const objc = ctypes.open("/usr/lib/libobjc.A.dylib");
+    const pointer = ctypes.voidptr_t;
+    const selector = objc.declare("sel_registerName", ctypes.default_abi, pointer, ctypes.char.ptr);
+    const getClass = objc.declare("objc_getClass", ctypes.default_abi, pointer, ctypes.char.ptr);
+    // Fixed signatures avoid Objective-C variadic calling conventions on arm64.
+    const getSigned = objc.declare("objc_msgSend", ctypes.default_abi, ctypes.long, pointer, pointer);
+    const getObject = objc.declare("objc_msgSend", ctypes.default_abi, pointer, pointer, pointer);
+    const getString = objc.declare("objc_msgSend", ctypes.default_abi, ctypes.char.ptr, pointer, pointer);
+    const getInt = objc.declare("objc_msgSend", ctypes.default_abi, ctypes.int, pointer, pointer);
+    const getDouble = objc.declare("objc_msgSend", ctypes.default_abi, ctypes.double, pointer, pointer);
+    const getRunningApp = objc.declare("objc_msgSend", ctypes.default_abi, pointer, pointer, pointer, ctypes.int);
+    const activate = objc.declare("objc_msgSend", ctypes.default_abi, ctypes.bool, pointer, pointer, ctypes.unsigned_long);
+    const string = value => value.isNull() ? null : getString(value, selector("UTF8String")).readString();
+    const applicationInfo = app => {
+      if (app.isNull()) return null;
+      const launchDate = getObject(app, selector("launchDate"));
+      return {
+        pid: number(getInt(app, selector("processIdentifier"))),
+        bundleId: string(getObject(app, selector("bundleIdentifier"))),
+        launchedAt: launchDate.isNull() ? null : getDouble(launchDate, selector("timeIntervalSince1970")),
+        regular: number(getSigned(app, selector("activationPolicy"))) === 0,
+      };
+    };
+    const number = value => Number(value.toString());
+    littleZenMacAppBridge = {
+      // Keep the library loaded for the lifetime of the function pointers.
+      objc,
+      frontmostApplication() {
+        const workspace = getObject(getClass("NSWorkspace"), selector("sharedWorkspace"));
+        return applicationInfo(getObject(workspace, selector("frontmostApplication")));
+      },
+      activateApplication(target) {
+        // Resolve again at use time; never save autoreleased native app pointers.
+        const app = getRunningApp(getClass("NSRunningApplication"),
+          selector("runningApplicationWithProcessIdentifier:"), target.pid);
+        const current = applicationInfo(app);
+        // PID + launch date prevents targeting a different process after PID reuse.
+        if (!current || current.bundleId !== target.bundleId ||
+            current.launchedAt !== target.launchedAt || !current.regular) return false;
+        return !!activate(app, selector("activateWithOptions:"), 0);
+      },
+    };
+    return littleZenMacAppBridge;
+  }
+
+  function createAppReturnTracker(native, ownPID, now = Date.now) {
+    return {
+      native,
+      current: null,
+      previous: null,
+      activatedAt: 0,
+      disposed: false,
+      returnTargets: new WeakMap(),
+      pendingReturn: null,
+      lastReturn: null,
+      record(app) {
+        if (this.disposed || !app?.regular) return;
+        if (this.current?.pid === app.pid) {
+          // Launch Services can fill in launchDate after the first observation.
+          // That metadata update is not an application switch.
+          this.current = { ...app };
+          return;
+        }
+        if (app.pid === ownPID) {
+          this.previous = this.current?.pid !== ownPID ? this.current : null;
+          this.activatedAt = now();
+        }
+        this.current = { ...app };
+      },
+      capture() {
+        if (this.disposed) return null;
+        const front = native.frontmostApplication();
+        this.record(front);
+        if (!front?.regular) return null;
+        if (front.pid !== ownPID) return { ...front };
+        // Do not resurrect an app from an unrelated, much older app switch.
+        if (this.previous && now() - this.activatedAt <= 5000) return { ...this.previous };
+        return null;
+      },
+      restore(target) {
+        if (this.disposed || !target || target.pid === ownPID || target.launchedAt === null) return false;
+        if (native.frontmostApplication()?.pid !== ownPID) return false;
+        return native.activateApplication(target);
+      },
+      requestReturn(target) {
+        this.pendingReturn = { target, after: now() + 50 };
+      },
+      drainReturns() {
+        if (!this.pendingReturn || now() < this.pendingReturn.after) return null;
+        const { target } = this.pendingReturn;
+        this.pendingReturn = null;
+        this.lastReturn = { requested: this.restore(target), pid: target.pid };
+        return this.lastReturn;
+      },
+    };
+  }
+
+  function getAppReturnTracker() {
+    if (!shouldRestorePreviousApp()) return null;
+    // A process-wide owner is essential: browser-window scripts are loaded once
+    // per window, and closing one must not stop application tracking.
+    const owner = Services.appShell.hiddenDOMWindow;
+    if (owner.__littleZenAppReturnTracker) return owner.__littleZenAppReturnTracker;
+    const native = getMacAppBridge();
+    const tracker = createAppReturnTracker(native, Services.appinfo.processID);
+    owner.__littleZenAppReturnTracker = tracker;
+    try {
+      tracker.record(native.frontmostApplication());
+      // A Gecko timer invokes JS safely on the main thread. An Objective-C IMP
+      // callback can re-enter JS in an unsafe native notification stack.
+      tracker.timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+      tracker.timer.initWithCallback(() => {
+        if (tracker.disposed) return;
+        if (!shouldRestorePreviousApp()) {
+          tracker.pendingReturn = null;
+          return;
+        }
+        try {
+          tracker.record(native.frontmostApplication());
+          const result = tracker.drainReturns();
+          if (result) log("Little Zen previous-app return", result);
+        } catch (error) {
+          tracker.disposed = true;
+          tracker.timer.cancel();
+          log("Little Zen previous-app tracking stopped", error);
+        }
+      }, 75, Ci.nsITimer.TYPE_REPEATING_SLACK);
+      const onQuit = () => {
+        tracker.disposed = true;
+        tracker.timer.cancel();
+        Services.obs.removeObserver(onQuit, "quit-application-granted");
+      };
+      Services.obs.addObserver(onQuit, "quit-application-granted");
+      log("Little Zen previous-app tracking started");
+    } catch (error) {
+      tracker.disposed = true;
+      tracker.timer?.cancel();
+      log("Little Zen previous-app tracking unavailable", error);
+    }
+    return tracker;
+  }
+
+  function isExternalLittleWindowSource(source) {
+    return source === "browserDOMWindow.openURI" ||
+      source === "browserDOMWindow.openURIInFrame" || source === "external-startup-window";
+  }
+
+  function capturePreviousApp(source) {
+    if (!isExternalLittleWindowSource(source)) return null;
+    try {
+      return getAppReturnTracker()?.capture() ?? null;
+    } catch (error) {
+      log("Little Zen could not capture the previous application", error);
+      return null;
+    }
+  }
+
+  function attachPreviousAppReturn(win, target) {
+    win.__littleZenReturnTarget = target;
+    delete win.__littleZenKeepZenFocused;
+    const existing = win.__littleZenAppReturnRecord;
+    if (existing) {
+      existing.target = target;
+      existing.keepZenFocused = false;
+      existing.closeAllowed = undefined;
+      return;
+    }
+    // Keep close state in the closure, not on the WindowProxy being torn down.
+    const record = { target, keepZenFocused: false, closeAllowed: undefined };
+    win.__littleZenAppReturnRecord = record;
+    const tracker = getAppReturnTracker();
+    const focus = Services.focus;
+    const prefs = Services.prefs;
+    const startup = Services.startup;
+    const onCloseRequest = () => {
+      // Explicitly closing a background browser window should not switch apps.
+      record.closeAllowed = focus.activeWindow === win;
+    };
+    win.addEventListener("close", onCloseRequest, true);
+    win.addEventListener("DOMWindowClose", onCloseRequest, true);
+    win.addEventListener("unload", () => {
+      const destination = record.target;
+      record.target = null;
+      if (!destination || record.keepZenFocused || record.closeAllowed === false ||
+          !prefs.getBoolPref(LITTLE_ZEN_RETURN_APP_PREF, true) || startup.shuttingDown) {
+        if (destination) log("Little Zen previous-app return skipped", {
+          keepZenFocused: record.keepZenFocused,
+          closeAllowed: record.closeAllowed,
+          quitting: startup.shuttingDown,
+        });
+        return;
+      }
+      // A callback belonging to a closed window may be discarded even if it
+      // was scheduled on another window. Pass data to the process timer instead.
+      tracker?.requestReturn(destination);
+    }, { once: true });
+  }
+
+  function keepZenFocusedOnClose(win) {
+    win.__littleZenKeepZenFocused = true;
+    if (win.__littleZenAppReturnRecord) win.__littleZenAppReturnRecord.keepZenFocused = true;
+  }
+
+  function rememberPreviousAppReturn(win, target) {
+    const tracker = getAppReturnTracker();
+    if (!tracker) return;
+    tracker.returnTargets.set(win, target);
+    // The initial about:blank document unloads while browser.xhtml starts.
+    // Do not attach a once-only unload handler to that temporary document.
+    if (win.__littleZenStartupReady || win.gBrowserInit?.delayedStartupFinished) {
+      attachPreviousAppReturn(win, target);
+    }
+  }
 
   const PATCH_FLAGS = {
     browserWindowTracker: "__littleZenBrowserWindowTrackerPatched",
@@ -537,7 +764,6 @@
         features: options.features ?? OPEN_FEATURES,
         zenSyncedWindow: false,
       };
-
       const littleWindow = originalOpenBrowserWindow.call(this, nextOptions);
       if (littleWindow) {
         markLittleWindowEarly(littleWindow, {
@@ -1228,6 +1454,8 @@
       win.close();
       return;
     }
+
+    keepZenFocusedOnClose(win);
 
     try {
       const principal = Services.scriptSecurityManager.getSystemPrincipal();
@@ -3002,6 +3230,7 @@
     }
 
     const url = getLittleWindowUrl(win);
+    keepZenFocusedOnClose(win);
     log("Transferring tab to workspace", { url, workspace: workspace.name });
 
     try {
@@ -3700,6 +3929,15 @@
   }
 
   const LittleZen = {
+    appReturnStatus() {
+      const tracker = getAppReturnTracker();
+      return tracker ? {
+        tracking: !tracker.disposed,
+        current: tracker.current,
+        previous: tracker.previous,
+        lastReturn: tracker.lastReturn,
+      } : { tracking: false };
+    },
     queueNavigation(win, url, meta = {}) {
       if (!url) {
         delete win.__littleZenSuppressUrlbarFocus;
@@ -3755,10 +3993,12 @@
         source,
         url,
       });
+      const returnTarget = capturePreviousApp(source);
 
       for (const browserWindow of browserWindows()) {
         if (isEmptyLittleWindow(browserWindow)) {
           log("Reusing existing empty Little Zen window");
+          rememberPreviousAppReturn(browserWindow, returnTarget);
           if (expanded) {
             applyExpandedLittleWindow(browserWindow, "expanded-reuse");
           }
@@ -3786,6 +4026,7 @@
       });
 
       if (littleWindow) {
+        rememberPreviousAppReturn(littleWindow, returnTarget);
         this.queueNavigation(littleWindow, url, { source, triggeringPrincipal });
         if (expanded) {
           whenStartupReady(littleWindow, () => {
@@ -3802,6 +4043,13 @@
   function bootstrapWindow(win) {
     if (!isBrowserWindow(win) || win[PATCH_FLAGS.window]) {
       return;
+    }
+    // Remove the preference left by the retired native-window experiment.
+    Services.prefs.clearUserPref("extensions.littleZen.macWindowMode");
+    try {
+      getAppReturnTracker();
+    } catch (error) {
+      log("Little Zen could not start previous-app tracking", error);
     }
 
     const redirectExternalStartup =
@@ -3891,6 +4139,12 @@
 
     whenStartupReady(win, () => {
       log("Little Zen delayed startup reached");
+      if (isLittleWindow(win)) {
+        const tracker = getAppReturnTracker();
+        if (tracker?.returnTargets.has(win)) {
+          attachPreviousAppReturn(win, tracker.returnTargets.get(win));
+        }
+      }
       if (redirectExternalStartup) {
         let attempts = 0;
         const redirect = () => {
