@@ -22,6 +22,7 @@
   const LITTLE_ZEN_ROUTING_DEBUG_PREF = "extensions.littleZen.debugRouting";
   const LITTLE_ZEN_STALLED_LOAD_TIMEOUT_MS = 25000;
   const LITTLE_ZEN_RETURN_APP_PREF = "extensions.littleZen.restorePreviousApp";
+  const LITTLE_ZEN_OPEN_HANDOFF_PREF = "extensions.littleZen.restoreWindowOrderOnOpen";
   let littleZenMacAppBridge;
 
   function shouldRestorePreviousApp() {
@@ -47,6 +48,9 @@
     const getDouble = objc.declare("objc_msgSend", ctypes.default_abi, ctypes.double, pointer, pointer);
     const getRunningApp = objc.declare("objc_msgSend", ctypes.default_abi, pointer, pointer, pointer, ctypes.int);
     const activate = objc.declare("objc_msgSend", ctypes.default_abi, ctypes.bool, pointer, pointer, ctypes.unsigned_long);
+    const getBool = objc.declare("objc_msgSend", ctypes.default_abi, ctypes.bool, pointer, pointer);
+    const getUnsigned = objc.declare("objc_msgSend", ctypes.default_abi, ctypes.unsigned_long, pointer, pointer);
+    const setUnsigned = objc.declare("objc_msgSend", ctypes.default_abi, ctypes.void_t, pointer, pointer, ctypes.unsigned_long);
     const string = value => value.isNull() ? null : getString(value, selector("UTF8String")).readString();
     const applicationInfo = app => {
       if (app.isNull()) return null;
@@ -59,6 +63,14 @@
       };
     };
     const number = value => Number(value.toString());
+    const nativeWindow = win => {
+      const handle = win.docShell.treeOwner.QueryInterface(Ci.nsIInterfaceRequestor)
+        .getInterface(Ci.nsIBaseWindow).nativeHandle.replace(/^0x0x/i, "0x");
+      if (!/^0x[0-9a-f]+$/i.test(handle) || /^0x0+$/i.test(handle)) {
+        throw new Error("Zen native window is unavailable");
+      }
+      return ctypes.cast(ctypes.uint64_t(handle), pointer);
+    };
     littleZenMacAppBridge = {
       // Keep the library loaded for the lifetime of the function pointers.
       objc,
@@ -76,11 +88,47 @@
             current.launchedAt !== target.launchedAt || !current.regular) return false;
         return !!activate(app, selector("activateWithOptions:"), 0);
       },
+      isWindowVisibleOnActiveSpace(win) {
+        const native = nativeWindow(win);
+        return !!getBool(native, selector("isOnActiveSpace")) &&
+          !!getBool(native, selector("isVisible")) &&
+          !getBool(native, selector("isMiniaturized"));
+      },
+      focusWindow(win) {
+        const native = nativeWindow(win);
+        if (getBool(native, selector("isOnActiveSpace"))) {
+          win.focus();
+          return;
+        }
+        // Temporarily move this window to the source app's desktop instead of
+        // activating it back on Zen's desktop. No floating/non-activating style.
+        const original = number(getUnsigned(native, selector("collectionBehavior")));
+        try {
+          setUnsigned(native, selector("setCollectionBehavior:"), (original & ~1) | 2);
+          win.focus();
+        } finally {
+          setUnsigned(native, selector("setCollectionBehavior:"), original);
+        }
+      },
     };
     return littleZenMacAppBridge;
   }
 
-  function createAppReturnTracker(native, ownPID, now = Date.now) {
+  function hasMainWindowOnActiveSpace(native) {
+    for (const win of browserWindows()) {
+      if (!isBrowserWindow(win) || isLittleWindow(win)) continue;
+      try {
+        if (native.isWindowVisibleOnActiveSpace(win)) return true;
+      } catch (error) {
+        // A closing window may lose its native handle during this check.
+        log("Little Zen could not check main-window Space visibility", error);
+      }
+    }
+    return false;
+  }
+
+  function createAppReturnTracker(native, ownPID, now = Date.now, isActiveWindow = () => true,
+    needsOpeningHandoff = () => true) {
     return {
       native,
       current: null,
@@ -90,6 +138,9 @@
       returnTargets: new WeakMap(),
       pendingReturn: null,
       lastReturn: null,
+      openingHandoffs: new Map(),
+      openingTargets: new WeakMap(),
+      lastOpeningHandoff: null,
       record(app) {
         if (this.disposed || !app?.regular) return;
         if (this.current?.pid === app.pid) {
@@ -129,6 +180,65 @@
         this.lastReturn = { requested: this.restore(target), pid: target.pid };
         return this.lastReturn;
       },
+      requestOpening(win, target) {
+        if (!target || this.disposed || this.openingTargets.get(win) === target) return;
+        this.openingTargets.set(win, target);
+        this.openingHandoffs.set(win, {
+          target, phase: "settling", after: now() + 150, deadline: now() + 3000,
+        });
+      },
+      drainOpenings() {
+        for (const [win, handoff] of this.openingHandoffs) {
+          const finish = (completed, reason) => {
+            this.openingHandoffs.delete(win);
+            this.lastOpeningHandoff = { completed, reason, pid: handoff.target.pid };
+          };
+          try {
+            if (this.disposed || win.closed || this.returnTargets.get(win) !== handoff.target ||
+                win.__littleZenKeepZenFocused || win.__littleZenAppReturnRecord?.keepZenFocused) {
+              finish(false, "cancelled");
+              continue;
+            }
+            if (now() > handoff.deadline) {
+              finish(false, "activation-timeout");
+              continue;
+            }
+            if (now() < handoff.after) continue;
+            const front = native.frontmostApplication();
+            if (handoff.phase === "settling") {
+              if (front?.pid !== ownPID || !isActiveWindow(win)) {
+                finish(false, "focus-changed");
+              } else if (!needsOpeningHandoff()) {
+                // Little Zen already has focus. Without a visible main window
+                // on this desktop, there is nothing to restack behind the source.
+                finish(false, "no-visible-main-window-on-active-space");
+              } else if (!native.activateApplication(handoff.target)) {
+                finish(false, "activation-refused");
+              } else {
+                handoff.phase = "waiting-for-source";
+              }
+            } else if (handoff.phase === "waiting-for-source") {
+              if (front?.pid === handoff.target.pid) {
+                // Give AppKit time to order the source app's windows forward.
+                handoff.phase = "focus-little-window";
+                handoff.after = now() + 150;
+              } else if (front?.pid !== ownPID) {
+                finish(false, "focus-changed");
+              }
+            } else if (front?.pid !== handoff.target.pid) {
+              finish(false, "focus-changed");
+            } else {
+              // A normal DOM window focus after the source app was activated
+              // targets Little Zen without raising the other Zen windows.
+              native.focusWindow(win);
+              finish(true, "little-window-focused");
+            }
+          } catch (error) {
+            finish(false, "handoff-failed");
+            log("Little Zen opening focus handoff failed", error);
+          }
+        }
+      },
     };
   }
 
@@ -139,7 +249,9 @@
     const owner = Services.appShell.hiddenDOMWindow;
     if (owner.__littleZenAppReturnTracker) return owner.__littleZenAppReturnTracker;
     const native = getMacAppBridge();
-    const tracker = createAppReturnTracker(native, Services.appinfo.processID);
+    const focus = Services.focus;
+    const tracker = createAppReturnTracker(native, Services.appinfo.processID,
+      Date.now, win => focus.activeWindow === win, () => hasMainWindowOnActiveSpace(native));
     owner.__littleZenAppReturnTracker = tracker;
     try {
       tracker.record(native.frontmostApplication());
@@ -150,12 +262,22 @@
         if (tracker.disposed) return;
         if (!shouldRestorePreviousApp()) {
           tracker.pendingReturn = null;
+          tracker.openingHandoffs.clear();
           return;
         }
         try {
           tracker.record(native.frontmostApplication());
           const result = tracker.drainReturns();
           if (result) log("Little Zen previous-app return", result);
+          if (Services.prefs.getBoolPref(LITTLE_ZEN_OPEN_HANDOFF_PREF, true)) {
+            const previousResult = tracker.lastOpeningHandoff;
+            tracker.drainOpenings();
+            if (tracker.lastOpeningHandoff !== previousResult) {
+              log("Little Zen opening focus handoff", tracker.lastOpeningHandoff);
+            }
+          } else {
+            tracker.openingHandoffs.clear();
+          }
         } catch (error) {
           tracker.disposed = true;
           tracker.timer.cancel();
@@ -164,6 +286,7 @@
       }, 75, Ci.nsITimer.TYPE_REPEATING_SLACK);
       const onQuit = () => {
         tracker.disposed = true;
+        tracker.openingHandoffs.clear();
         tracker.timer.cancel();
         Services.obs.removeObserver(onQuit, "quit-application-granted");
       };
@@ -247,6 +370,14 @@
     if (win.__littleZenStartupReady || win.gBrowserInit?.delayedStartupFinished) {
       attachPreviousAppReturn(win, target);
     }
+  }
+
+  function scheduleOpeningFocusHandoff(win) {
+    if (!shouldRestorePreviousApp() ||
+        !Services.prefs.getBoolPref(LITTLE_ZEN_OPEN_HANDOFF_PREF, true)) return;
+    const tracker = getAppReturnTracker();
+    const target = tracker?.returnTargets.get(win);
+    if (target) tracker.requestOpening(win, target);
   }
 
   const PATCH_FLAGS = {
@@ -920,6 +1051,10 @@
   }
 
   function patchUrlbar(win) {
+    // Normal windows must keep Zen's native domain-only URL formatting.
+    if (!isLittleWindow(win)) {
+      return;
+    }
     const urlbar = win.gURLBar;
     if (!urlbar || urlbar[PATCH_FLAGS.urlbar]) {
       return;
@@ -1526,6 +1661,7 @@
 
     leaveEmptyTabMode(win, reason);
     setLittleWindowLoading(win, false, reason);
+    scheduleOpeningFocusHandoff(win);
   }
 
   function positionLittleWindowNavbar(win) {
@@ -3936,6 +4072,7 @@
         current: tracker.current,
         previous: tracker.previous,
         lastReturn: tracker.lastReturn,
+        lastOpeningHandoff: tracker.lastOpeningHandoff,
       } : { tracking: false };
     },
     queueNavigation(win, url, meta = {}) {
