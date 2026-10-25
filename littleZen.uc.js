@@ -174,6 +174,9 @@
     return {
       littleWindow: isLittleWindow(win),
       startupReady: !!win?.__littleZenStartupReady,
+      navigationReady: !!win?.__littleZenNavigationReady,
+      waitingForSessionRestore: !!win?.__littleZenWaitingForSessionRestore,
+      zenStartupReady: !!win?.gZenStartup?.isReady,
       pendingUrl: win?.__littleZenPendingURL ?? null,
       rootEmpty: !!root?.hasAttribute("zen-has-empty-tab"),
       tabEmpty: !!tab?.hasAttribute("zen-empty-tab"),
@@ -446,6 +449,7 @@
             url,
             source: "browserDOMWindow.openURI",
             triggeringPrincipal: aTriggeringPrincipal,
+            expanded: true,
           });
           return null;
         }
@@ -477,6 +481,7 @@
           LittleZen.openLittleWindow(win, {
             url,
             source: "browserDOMWindow.openURIInFrame",
+            expanded: true,
           });
           return null;
         }
@@ -983,7 +988,9 @@
   }
 
   function attachEmptyTabStateTracking(win) {
-    if (win[PATCH_FLAGS.emptyState]) {
+    // Early bootstrap can run before gBrowser exists. Do not mark the listener
+    // installed until there is an actual tabbrowser to subscribe to.
+    if (win[PATCH_FLAGS.emptyState] || !win.gBrowser?.addTabsProgressListener) {
       return;
     }
 
@@ -1006,9 +1013,16 @@
     };
 
     const progressListener = {
-      onLocationChange(browser, _webProgress, _request, _locationURI) {
-        if (browser === win.gBrowser?.selectedBrowser) {
+      onLocationChange(browser, webProgress, _request, locationURI) {
+        if (
+          browser === win.gBrowser?.selectedBrowser &&
+          (webProgress?.isTopLevel ?? true)
+        ) {
           scheduleThemeUpdate("location-change");
+          // Same-document/cached navigation may not produce a network STOP.
+          if (webProgress?.isLoadingDocument === false) {
+            finishLittleWindowLoading(win, browser, "location-change", locationURI);
+          }
         }
       },
 
@@ -1018,15 +1032,12 @@
           (webProgress?.isTopLevel ?? true) &&
           stateFlags & Ci.nsIWebProgressListener.STATE_STOP
         ) {
-          scheduleThemeUpdate("state-stop");
-          const currentSpec = browser.currentURI?.spec ?? "";
-          if (
-            stateFlags & Ci.nsIWebProgressListener.STATE_IS_NETWORK &&
-            !win.__littleZenPendingURL &&
-            !isEmptyLittleWindow(win) &&
-            currentSpec !== "about:blank"
-          ) {
-            setLittleWindowLoading(win, false, "state-stop");
+          // A document/window STOP also covers cached and error documents.
+          // Subresource STOP notifications must not dismiss the loading veil.
+          const loadTypes = Ci.nsIWebProgressListener;
+          if (stateFlags & (loadTypes.STATE_IS_NETWORK | loadTypes.STATE_IS_WINDOW)) {
+            scheduleThemeUpdate("state-stop");
+            finishLittleWindowLoading(win, browser, "state-stop");
           }
         }
       },
@@ -1037,7 +1048,7 @@
     win.addEventListener("TabOpen", sync, true);
     win.addEventListener("TabClose", sync, true);
     try {
-      win.gBrowser?.addTabsProgressListener?.(progressListener);
+      win.gBrowser.addTabsProgressListener(progressListener);
       win.addEventListener(
         "unload",
         () => {
@@ -1049,6 +1060,10 @@
       );
     } catch (error) {
       log("Could not attach Little Zen theme progress listener", error);
+      for (const type of ["TabAttrModified", "TabSelect", "TabOpen", "TabClose"]) {
+        win.removeEventListener(type, sync, true);
+      }
+      return;
     }
     win[PATCH_FLAGS.emptyState] = true;
     log("Attached Little Zen empty-tab state tracking");
@@ -1157,8 +1172,15 @@
   }
 
   function scheduleLittleWindowLoadingFallback(win, reason = "unknown") {
-    clearLittleWindowLoadingFallback(win);
     if (!isLittleWindow(win)) {
+      return;
+    }
+
+    // Repeated startup/retry events must not postpone the fallback forever.
+    if (
+      win.__littleZenStalledLoadTimer ||
+      win.document.documentElement.hasAttribute("zen-little-window-load-stalled")
+    ) {
       return;
     }
 
@@ -1256,6 +1278,26 @@
     logLittleWindowState(win, isLoading ? "Entered Little Zen loading veil" : "Left Little Zen loading veil", {
       reason,
     });
+  }
+
+  function finishLittleWindowLoading(win, browser, reason, locationURI = browser?.currentURI) {
+    if (
+      !isLittleWindow(win) ||
+      browser !== win.gBrowser?.selectedBrowser ||
+      win.__littleZenPendingURL ||
+      !win.__littleZenNavigationDispatched
+    ) {
+      return;
+    }
+
+    // Initial placeholder loads can finish after the real URL was queued.
+    const spec = locationURI?.spec ?? "";
+    if (!spec || spec === "about:blank" || spec === "about:newtab") {
+      return;
+    }
+
+    leaveEmptyTabMode(win, reason);
+    setLittleWindowLoading(win, false, reason);
   }
 
   function positionLittleWindowNavbar(win) {
@@ -1367,12 +1409,24 @@
       return false;
     }
 
+    // Firefox's delayed startup finishes before Zen selects its start page.
+    // Loading its temporary browser here can lose the navigation when Zen
+    // replaces that tab during session/workspace restoration.
+    if (!ensureLittleWindowNavigationReady(win)) {
+      return false;
+    }
+
     let selectedBrowser = win.gBrowser?.selectedBrowser;
     if (!selectedBrowser) {
       logLittleWindowState(win, "Little Zen pending URL waiting for selected browser", {
         reason,
         url: pendingUrl,
       });
+      return false;
+    }
+
+    attachEmptyTabStateTracking(win);
+    if (!win[PATCH_FLAGS.emptyState]) {
       return false;
     }
 
@@ -1420,6 +1474,7 @@
       });
 
       let loadedByNewTab = false;
+      win.__littleZenNavigationDispatched = true;
       if (selectedTab && currentContainerId !== targetContainerId) {
         const routedTabOptions = {
           triggeringPrincipal: principal,
@@ -1464,6 +1519,7 @@
           });
           win.__littleZenPendingURL = pendingUrl;
           win.__littleZenPendingURLMeta = pendingMeta;
+          delete win.__littleZenNavigationDispatched;
           setLittleWindowLoading(win, true, `retry:${reason}`);
           return false;
         }
@@ -1508,6 +1564,7 @@
       log("Failed to load queued Little Zen URL", pendingUrl, error);
       win.__littleZenPendingURL = pendingUrl;
       win.__littleZenPendingURLMeta = pendingMeta;
+      delete win.__littleZenNavigationDispatched;
       setLittleWindowLoading(win, true, `error:${reason}`);
       return false;
     }
@@ -1540,6 +1597,64 @@
     win.setTimeout(() => {
       attemptFlush("timeout-500");
     }, 500);
+  }
+
+  function ensureLittleWindowNavigationReady(win) {
+    if (win.__littleZenNavigationReady) {
+      return true;
+    }
+    if (win.__littleZenWaitingForSessionRestore || win.closed) {
+      return false;
+    }
+
+    win.__littleZenWaitingForSessionRestore = true;
+    logLittleWindowState(win, "Little Zen navigation waiting for Zen session restore");
+
+    const waitForManagers = () => {
+      if (win.closed) {
+        return;
+      }
+      // Managers may be assigned after our early bootstrap script runs.
+      if (!win.gZenWorkspaces || !win.gZenStartup) {
+        win.__littleZenRestoreReadyTimer = win.setTimeout(waitForManagers, 50);
+        return;
+      }
+
+      delete win.__littleZenRestoreReadyTimer;
+      Promise.all([
+        win.gZenWorkspaces.promiseInitialized,
+        win.gZenStartup.promiseInitialized,
+      ]).then(() => {
+        if (win.closed) {
+          return;
+        }
+        // selectStartPage also queues focus/new-tab work with setTimeout(0).
+        // Let that finish before choosing the browser for our navigation.
+        win.__littleZenRestoreReadyTimer = win.setTimeout(() => {
+          delete win.__littleZenRestoreReadyTimer;
+          if (win.closed) {
+            return;
+          }
+          win.removeEventListener("unload", cleanup);
+          delete win.__littleZenWaitingForSessionRestore;
+          win.__littleZenNavigationReady = true;
+          logLittleWindowState(win, "Little Zen session restore finished; navigation ready");
+          schedulePendingNavigationFlush(win, "zen-session-restored");
+        }, 0);
+      }).catch(error => {
+        // Keep the URL queued and leave the stalled-load actions available.
+        log("Little Zen session restore failed", error);
+      });
+    };
+    const cleanup = () => {
+      if (win.__littleZenRestoreReadyTimer) {
+        win.clearTimeout(win.__littleZenRestoreReadyTimer);
+        delete win.__littleZenRestoreReadyTimer;
+      }
+    };
+    win.addEventListener("unload", cleanup, { once: true });
+    waitForManagers();
+    return false;
   }
 
   function focusUrlbar(win) {
@@ -3424,36 +3539,38 @@
   }
 
   function whenStartupReady(win, callback) {
+    if (win.closed) {
+      return;
+    }
     if (win.gBrowserInit?.delayedStartupFinished) {
       win.__littleZenStartupReady = true;
       callback();
       return;
     }
 
-    const observer = new win.MutationObserver(() => {
-      if (!win.gBrowserInit?.delayedStartupFinished) {
+    // A JS property change is not a DOM mutation. On another macOS desktop
+    // there may be no subsequent paint/layout mutation to wake the old observer.
+    const topic = "browser-delayed-startup-finished";
+    let finished = false;
+    const cleanup = () => {
+      finished = true;
+      Services.obs.removeObserver(onStartup, topic);
+      win.removeEventListener("unload", cleanup);
+    };
+    const onStartup = subject => {
+      if (subject !== win || finished) {
         return;
       }
-      observer.disconnect();
+      cleanup();
       win.__littleZenStartupReady = true;
       callback();
-    });
-
-    observer.observe(win.document.documentElement, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-    });
-
-    win.addEventListener(
-      "unload",
-      () => {
-        try {
-          observer.disconnect();
-        } catch (error) {}
-      },
-      { once: true }
-    );
+    };
+    Services.obs.addObserver(onStartup, topic);
+    win.addEventListener("unload", cleanup, { once: true });
+    // Also cover startup completing immediately before observer registration.
+    if (win.gBrowserInit?.delayedStartupFinished) {
+      onStartup(win);
+    }
   }
 
   function ensureCommand(win) {
@@ -3590,6 +3707,7 @@
       }
 
       win.__littleZenSuppressUrlbarFocus = true;
+      delete win.__littleZenNavigationDispatched;
       markLittleWindowEarly(win, { url, meta });
       setLittleWindowLoading(win, true, "queue-navigation");
       closeLittleWindowUrlbar(win, "queue-navigation");
